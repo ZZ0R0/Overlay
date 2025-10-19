@@ -17,8 +17,8 @@ use windows::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC, SND_NODEFAU
 
 // ======================= Constantes =======================
 
+const SESSION_GAP_MS: u64 = 1_000;    // frappe "continue" si < 15 s
 const IDLE_THRESHOLD_MS: u64 = 30_000; // apparition après 30 s d'inactivité
-const SESSION_GAP_MS: u64 = 15_000;    // frappe "continue" si < 15 s
 const ALERT_MS: u64 = 60_000;          // barre 0→60 s, puis alerte
 
 const TICK_MS: u64 = 200;
@@ -93,7 +93,8 @@ fn play_disconnect_alert() {}
 
 enum Msg {
     Tick,
-    KeyActivity(Instant), // frappes texte uniquement
+    /// `count_key = true` pour une frappe clavier comptable, `false` pour un clic souris (non compté).
+    InputActivity { at: Instant, count_key: bool },
 }
 
 // ======================= Stats =======================
@@ -179,7 +180,6 @@ impl IdleApp {
         (size.y / 170.0).clamp(1.0, 1.7)
     }
     fn apply_text_style(&self, ctx: &egui::Context) {
-        // Simule du gras via .strong() + tailles plus grandes
         let scale = self.ui_scale_factor(ctx);
         let mut style = (*ctx.style()).clone();
         style.text_styles = [
@@ -221,8 +221,9 @@ impl IdleApp {
         self.place_center(ctx);
         self.visible_since = Some(Instant::now());
         self.alert_fired = false;
-        self.pending_connect_sound = true; // une seule fois à la reprise
+        self.pending_connect_sound = false; // une seule fois à la reprise
         self.window_visible = true;
+
     }
     fn hide_window(&mut self, ctx: &egui::Context) {
         self.place_offscreen(ctx);
@@ -258,6 +259,7 @@ impl IdleApp {
             let vms = self.visible_elapsed_ms();
             if vms >= ALERT_MS && !self.alert_fired {
                 self.alert_fired = true;
+                self.pending_connect_sound = true;
                 play_disconnect_alert();
             }
         }
@@ -294,10 +296,12 @@ impl eframe::App for IdleApp {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Tick => self.handle_tick(ctx),
-                Msg::KeyActivity(t) => {
+                Msg::InputActivity { at, count_key } => {
                     let fullscreen = fullscreen_active_on_any_monitor();
-                    self.last_key = t;
-                    self.stats.key_presses = self.stats.key_presses.saturating_add(1);
+                    self.last_key = at;
+                    if count_key {
+                        self.stats.key_presses = self.stats.key_presses.saturating_add(1);
+                    }
 
                     if self.window_visible && self.pending_connect_sound && !fullscreen {
                         self.pending_connect_sound = false;
@@ -393,13 +397,19 @@ fn spawn_tick_thread(tx: Sender<Msg>) {
     });
 }
 
-fn spawn_keyboard_thread(tx: Sender<Msg>) {
+fn spawn_input_thread(tx: Sender<Msg>) {
     std::thread::spawn(move || {
         let callback = move |event: Event| {
-            if let EventType::KeyPress(k) = event.event_type {
-                if is_character_key(k) {
-                    let _ = tx.send(Msg::KeyActivity(Instant::now()));
+            match event.event_type {
+                // Comptabilise uniquement les touches "caractères".
+                EventType::KeyPress(k) if is_character_key(k) => {
+                    let _ = tx.send(Msg::InputActivity { at: Instant::now(), count_key: true });
                 }
+                // Tout clic souris déclenche le reset mais ne compte pas comme "key".
+                EventType::ButtonPress(_) => {
+                    let _ = tx.send(Msg::InputActivity { at: Instant::now(), count_key: false });
+                }
+                _ => {}
             }
         };
         let _ = rdev::listen(callback);
@@ -411,7 +421,7 @@ fn spawn_keyboard_thread(tx: Sender<Msg>) {
 fn main() -> eframe::Result<()> {
     let (tx, rx) = unbounded();
     spawn_tick_thread(tx.clone());
-    spawn_keyboard_thread(tx);
+    spawn_input_thread(tx);
 
     // Démarre "minimisée": fenêtre décorée, topmost, mais placée hors-écran au 1er frame.
     let viewport = egui::ViewportBuilder::default()
